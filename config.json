@@ -1,0 +1,17 @@
+{
+    "RTMP_PORT": 1935,
+    "WEB_PORT": 5000,
+    "HTTP_PORT": 8000,
+    "STREAM_DIR": "hls_stream",
+    "TUNNEL_MODE": "cloudflared",
+    "NGROK_TOKEN": "2OH13VON5VdUP5i3I535R0jh5FP_6BQLCftAi9jVqsgGDtXLv",
+    "LOCALXPOSE_TOKEN": "ZUULku3l8RJGyuXsBU6iKKlH9oSBoLO73r3HJsFP",
+    "CLOUDFLARED_TOKEN": "",
+    "FFMPEG_HLS_TIME": "0.5",
+    "FFMPEG_HLS_LIST_SIZE": "3",
+    "FFMPEG_GOP": "60",
+    "FFMPEG_PRESET": "fast",
+    "FFMPEG_CRF": "23",
+    "FFMPEG_MAXRATE": "10000k",
+    "FFMPEG_BUFSIZE": "5000k"
+}
