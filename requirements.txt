@@ -1,3 +1,6 @@
-flask
+fastapi
+uvicorn
 requests
-pyside6
+PySide6
+pydantic
+psutil

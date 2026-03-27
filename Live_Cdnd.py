@@ -1,117 +1,93 @@
-import subprocess
-import threading
-import time
+import asyncio
 import os
 import sys
 import json
 import re
 import signal
 import shutil
-import requests
-from flask import Flask, Response, send_file, jsonify, request
+import time
+import subprocess
+from urllib.parse import urlparse
+from fastapi import FastAPI, Request, Response, BackgroundTasks
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-# Configurações Globais
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-    FFMPEG_CMD = 'ffmpeg'
+# Globais
+if getattr(sys, 'frozen', False):
+    base_dir = os.path.dirname(sys.executable)
+else:
+    base_dir = os.path.abspath(os.path.dirname(__file__))
 
-# Estado Global
+BIN_DIR = os.path.join(base_dir, 'bin')
+os.makedirs(BIN_DIR, exist_ok=True)
+os.environ["PATH"] += os.pathsep + BIN_DIR
+
+FFMPEG_CMD = 'ffmpeg.exe' if sys.platform == 'win32' else 'ffmpeg'
 obs_connected = False
 stream_start_time = None
-rtmp_server_process = None
+rtmp_process = None
 tunnel_process = None
 connection_log = []
 segment_log = []
+stream_enabled = True
 is_streaming = False
 public_url = None
 tunnel_error = None
 active_viewers = {}
 stream_metrics = {'fps': '0', 'bitrate': '0k', 'speed': '0x', 'dropped': '0'}
 
-# Configurações Padrão
+# Defaults
 RTMP_PORT = 1935
 WEB_PORT = 5000
 HTTP_PORT = 8000
-STREAM_DIR = 'hls_stream'
-KEEP_RECENT = 10
-MIN_AGE_SECONDS = 30
+STREAM_DIR = '/dev/shm/hls_stream' if sys.platform != 'win32' else 'hls_stream'
+KEEP_RECENT = 5
 TUNNEL_MODE = 'cloudflared'
 NGROK_TOKEN = ''
 LOCALXPOSE_TOKEN = ''
 CLOUDFLARED_TOKEN = ''
-
-# FFmpeg Defaults
-FFMPEG_HLS_TIME = '2'
-FFMPEG_HLS_LIST_SIZE = '4'
-FFMPEG_GOP = '60'
+FFMPEG_HLS_TIME = '1'
+FFMPEG_HLS_LIST_SIZE = '2'
+FFMPEG_GOP = '30'
 FFMPEG_PRESET = 'superfast'
 FFMPEG_CRF = '23'
-FFMPEG_MAXRATE = '2500k'
-FFMPEG_BUFSIZE = '5000k'
+FFMPEG_MAXRATE = '7000k'
+FFMPEG_BUFSIZE = '14000k'
 
-app = Flask(__name__)
+app = FastAPI(title="VRStream API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-def log(msg):
+def log(msg: str):
     timestamp = time.strftime("%H:%M:%S")
     full_msg = f"[{timestamp}] {msg}"
     print(full_msg)
     sys.stdout.flush()
     connection_log.append(full_msg)
-    if len(connection_log) > 100:
-        connection_log.pop(0)
+    if len(connection_log) > 100: connection_log.pop(0)
 
-def log_segment(msg):
+def log_segment(msg: str):
     timestamp = time.strftime("%H:%M:%S")
     full_msg = f"[{timestamp}] {msg}"
     segment_log.append(full_msg)
-    if len(segment_log) > 100:
-        segment_log.pop(0)
+    if len(segment_log) > 100: segment_log.pop(0)
 
-def get_client_ip():
-    """Obtém o IP real do cliente, mesmo atrás de proxy/tunnel"""
-    if request.headers.get('CF-Connecting-IP'):
-        return request.headers.get('CF-Connecting-IP')
-    if request.headers.get('X-Forwarded-For'):
-        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
-    if request.headers.get('X-Real-IP'):
-        return request.headers.get('X-Real-IP')
-    return request.remote_addr
-
-def kill_process_by_name(name):
-    try:
-        if sys.platform == 'win32':
-            subprocess.run(['taskkill', '/F', '/IM', name], capture_output=True)
-        else:
-            subprocess.run(['pkill', '-f', name], capture_output=True)
-    except:
-        pass
-
-def kill_port(port):
-    try:
-        if sys.platform == 'win32':
-            result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True)
-            for line in result.stdout.split('\n'):
-                if f':{port}' in line and 'LISTENING' in line:
-                    pid = line.strip().split()[-1]
-                    subprocess.run(['taskkill', '/F', '/PID', pid], capture_output=True)
-                    log(f"Processo {pid} usando porta {port} foi encerrado")
-        else:
-            subprocess.run(['fuser', '-k', f'{port}/tcp'], capture_output=True)
-            log(f"Porta {port} liberada")
-    except:
-        pass
+def get_client_ip(req: Request):
+    if req.headers.get('CF-Connecting-IP'): return req.headers.get('CF-Connecting-IP')
+    if req.headers.get('X-Forwarded-For'): return req.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return req.client.host if req.client else "127.0.0.1"
 
 def load_config():
-    global TUNNEL_MODE, NGROK_TOKEN, LOCALXPOSE_TOKEN, CLOUDFLARED_TOKEN, RTMP_PORT, WEB_PORT, HTTP_PORT
+    global TUNNEL_MODE, NGROK_TOKEN, LOCALXPOSE_TOKEN, CLOUDFLARED_TOKEN, RTMP_PORT, WEB_PORT, HTTP_PORT, STREAM_DIR
     global FFMPEG_HLS_TIME, FFMPEG_HLS_LIST_SIZE, FFMPEG_GOP, FFMPEG_PRESET, FFMPEG_CRF, FFMPEG_MAXRATE, FFMPEG_BUFSIZE
-    
     config = {
         'RTMP_PORT': RTMP_PORT, 'WEB_PORT': WEB_PORT, 'HTTP_PORT': HTTP_PORT, 'STREAM_DIR': STREAM_DIR,
         'TUNNEL_MODE': TUNNEL_MODE, 'NGROK_TOKEN': NGROK_TOKEN, 'LOCALXPOSE_TOKEN': LOCALXPOSE_TOKEN,
-        'CLOUDFLARED_TOKEN': CLOUDFLARED_TOKEN,
-        'FFMPEG_HLS_TIME': FFMPEG_HLS_TIME, 'FFMPEG_HLS_LIST_SIZE': FFMPEG_HLS_LIST_SIZE,
+        'CLOUDFLARED_TOKEN': CLOUDFLARED_TOKEN, 'FFMPEG_HLS_TIME': FFMPEG_HLS_TIME, 'FFMPEG_HLS_LIST_SIZE': FFMPEG_HLS_LIST_SIZE,
         'FFMPEG_GOP': FFMPEG_GOP, 'FFMPEG_PRESET': FFMPEG_PRESET, 'FFMPEG_CRF': FFMPEG_CRF,
         'FFMPEG_MAXRATE': FFMPEG_MAXRATE, 'FFMPEG_BUFSIZE': FFMPEG_BUFSIZE
     }
@@ -120,286 +96,248 @@ def load_config():
             with open('config.json', 'r') as f:
                 loaded = json.load(f)
                 config.update(loaded)
-                
-                TUNNEL_MODE = config.get('TUNNEL_MODE') or 'cloudflared'
+                TUNNEL_MODE = config.get('TUNNEL_MODE', 'cloudflared')
                 NGROK_TOKEN = config.get('NGROK_TOKEN', '')
                 LOCALXPOSE_TOKEN = config.get('LOCALXPOSE_TOKEN', '')
                 CLOUDFLARED_TOKEN = config.get('CLOUDFLARED_TOKEN', '')
-                RTMP_PORT = config.get('RTMP_PORT', 1935)
-                WEB_PORT = config.get('WEB_PORT', 5000)
-                HTTP_PORT = config.get('HTTP_PORT', 8000)
-                
-                FFMPEG_HLS_TIME = config.get('FFMPEG_HLS_TIME', '2')
-                FFMPEG_HLS_LIST_SIZE = config.get('FFMPEG_HLS_LIST_SIZE', '4')
-                FFMPEG_GOP = config.get('FFMPEG_GOP', '60')
+                RTMP_PORT = int(config.get('RTMP_PORT', 1935))
+                WEB_PORT = int(config.get('WEB_PORT', 5000))
+                HTTP_PORT = int(config.get('HTTP_PORT', 8000))
+                STREAM_DIR = config.get('STREAM_DIR', '/dev/shm/hls_stream' if sys.platform != 'win32' else 'hls_stream')
+                if sys.platform != 'win32' and STREAM_DIR == 'hls_stream': STREAM_DIR = '/dev/shm/hls_stream'
+                FFMPEG_HLS_TIME = config.get('FFMPEG_HLS_TIME', '1')
+                FFMPEG_HLS_LIST_SIZE = config.get('FFMPEG_HLS_LIST_SIZE', '2')
+                FFMPEG_GOP = config.get('FFMPEG_GOP', '30')
                 FFMPEG_PRESET = config.get('FFMPEG_PRESET', 'superfast')
                 FFMPEG_CRF = config.get('FFMPEG_CRF', '23')
-                FFMPEG_MAXRATE = config.get('FFMPEG_MAXRATE', '2500k')
-                FFMPEG_BUFSIZE = config.get('FFMPEG_BUFSIZE', '5000k')
-                
-                # Atualizar dict para retorno
-                config['FFMPEG_HLS_TIME'] = FFMPEG_HLS_TIME
-                config['FFMPEG_HLS_LIST_SIZE'] = FFMPEG_HLS_LIST_SIZE
-                config['FFMPEG_GOP'] = FFMPEG_GOP
-                config['FFMPEG_PRESET'] = FFMPEG_PRESET
-                config['FFMPEG_CRF'] = FFMPEG_CRF
-                config['FFMPEG_MAXRATE'] = FFMPEG_MAXRATE
-                config['FFMPEG_BUFSIZE'] = FFMPEG_BUFSIZE
-                
-    except Exception as e:
-        log(f"Erro ao carregar config: {e}")
+                FFMPEG_MAXRATE = config.get('FFMPEG_MAXRATE', '7000k')
+                FFMPEG_BUFSIZE = config.get('FFMPEG_BUFSIZE', '14000k')
+    except Exception as e: log(f"Erro config: {e}")
     return config
 
-def save_config_file(new_config):
-    global TUNNEL_MODE, NGROK_TOKEN, LOCALXPOSE_TOKEN, CLOUDFLARED_TOKEN, RTMP_PORT, WEB_PORT, HTTP_PORT
-    global FFMPEG_HLS_TIME, FFMPEG_HLS_LIST_SIZE, FFMPEG_GOP, FFMPEG_PRESET, FFMPEG_CRF, FFMPEG_MAXRATE, FFMPEG_BUFSIZE
+def save_config_file(new_config: dict):
     try:
-        with open('config.json', 'w') as f:
-            json.dump(new_config, f, indent=4)
-        
-        TUNNEL_MODE = new_config.get('TUNNEL_MODE', 'cloudflared')
-        NGROK_TOKEN = new_config.get('NGROK_TOKEN', '')
-        LOCALXPOSE_TOKEN = new_config.get('LOCALXPOSE_TOKEN', '')
-        CLOUDFLARED_TOKEN = new_config.get('CLOUDFLARED_TOKEN', '')
-        RTMP_PORT = new_config.get('RTMP_PORT', 1935)
-        WEB_PORT = new_config.get('WEB_PORT', 5000)
-        HTTP_PORT = new_config.get('HTTP_PORT', 8000)
-        
-        FFMPEG_HLS_TIME = new_config.get('FFMPEG_HLS_TIME', '2')
-        FFMPEG_HLS_LIST_SIZE = new_config.get('FFMPEG_HLS_LIST_SIZE', '4')
-        FFMPEG_GOP = new_config.get('FFMPEG_GOP', '60')
-        FFMPEG_PRESET = new_config.get('FFMPEG_PRESET', 'superfast')
-        FFMPEG_CRF = new_config.get('FFMPEG_CRF', '23')
-        FFMPEG_MAXRATE = new_config.get('FFMPEG_MAXRATE', '2500k')
-        FFMPEG_BUFSIZE = new_config.get('FFMPEG_BUFSIZE', '5000k')
+        current = load_config()
+        current.update(new_config)
+        with open('config.json', 'w') as f: json.dump(current, f, indent=4)
+        load_config()
         return True
-    except Exception as e:
-        log(f"Erro ao salvar config: {e}")
-        return False
+    except: return False
 
-def start_ngrok():
-    global public_url, tunnel_process, tunnel_error
-    if not NGROK_TOKEN:
-        tunnel_error = 'missing_token_ngrok'
-        log("❌ Token do Ngrok não configurado!")
-        return
+def kill_process_by_name(name):
     try:
-        log(f"🌍 Iniciando Ngrok na porta {HTTP_PORT}...")
-        ngrok_cmd = 'ngrok.exe' if os.path.exists('ngrok.exe') else 'ngrok'
-        tunnel_process = subprocess.Popen([ngrok_cmd, 'http', '--authtoken', NGROK_TOKEN, str(HTTP_PORT), '--log', 'stdout'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
-        for line in tunnel_process.stdout:
-             if 'url=' in line:
-                match = re.search(r'url=(https://[^\s]+)', line)
-                if match:
-                    public_url = match.group(1)
-                    log(f"✅ URL Pública: {public_url}")
-                    break
-    except Exception as e:
-        log(f"⚠️ Erro no Ngrok: {e}")
+        if sys.platform == 'win32': subprocess.run(['taskkill', '/F', '/IM', name], capture_output=True)
+        else: subprocess.run(['pkill', '-f', name], capture_output=True)
+    except: pass
 
-def start_localxpose():
+async def terminate_process(proc):
+    if proc:
+        try:
+            proc.terminate()
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except:
+            try: proc.kill()
+            except: pass
+
+async def start_ngrok():
     global public_url, tunnel_process, tunnel_error
-    if not LOCALXPOSE_TOKEN:
-        tunnel_error = 'missing_token_localxpose'
-        log("❌ Token do Localxpose não configurado!")
-        return
+    if not NGROK_TOKEN: tunnel_error = 'missing_token_ngrok'; return
+    cmd = 'ngrok.exe' if sys.platform == 'win32' else 'ngrok'
     try:
-        log(f"🌍 Iniciando Localxpose na porta {HTTP_PORT}...")
-        env = os.environ.copy()
-        env['ACCESS_TOKEN'] = LOCALXPOSE_TOKEN
-        loclx_cmd = 'loclx.exe' if os.path.exists('loclx.exe') else 'loclx'
-        tunnel_process = subprocess.Popen([loclx_cmd, 'tunnel', 'http', '--to', f'127.0.0.1:{HTTP_PORT}'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, encoding='utf-8', errors='ignore')
-        while True:
-            line = tunnel_process.stdout.readline()
-            if not line: break
-            if '.loclx.io' in line:
-                match = re.search(r'([a-zA-Z0-9-]+\.loclx\.io)', line)
-                if match:
-                    public_url = "https://" + match.group(1)
-                    log(f"✅ URL Pública: {public_url}")
-                    break
-    except Exception as e:
-        log(f"⚠️ Erro no Localxpose: {e}")
+        tunnel_process = await asyncio.create_subprocess_exec(
+            cmd, 'http', '--authtoken', NGROK_TOKEN, str(WEB_PORT), '--log', 'stdout',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        )
+        async def _parse():
+            global public_url
+            while True:
+                line = await tunnel_process.stdout.readline()
+                if not line: break
+                decoded = line.decode('utf-8', errors='ignore')
+                if not public_url and 'url=' in decoded:
+                    m = re.search(r'url=(https://[^\s]+)', decoded)
+                    if m: public_url = m.group(1); log(f"✅ URL: {public_url}")
+        asyncio.create_task(_parse())
+    except Exception as e: log(f"⚠️ Erro Ngrok: {e}")
 
-def start_cloudflare():
+async def start_localxpose():
+    global public_url, tunnel_process, tunnel_error
+    if not LOCALXPOSE_TOKEN: tunnel_error = 'missing_token_localxpose'; return
+    cmd = 'loclx.exe' if sys.platform == 'win32' else 'loclx'
+    env = os.environ.copy(); env['ACCESS_TOKEN'] = LOCALXPOSE_TOKEN
+    try:
+        tunnel_process = await asyncio.create_subprocess_exec(
+            cmd, 'tunnel', 'http', '--to', f'127.0.0.1:{WEB_PORT}',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
+        )
+        async def _parse():
+            global public_url
+            while True:
+                line = await tunnel_process.stdout.readline()
+                if not line: break
+                decoded = line.decode('utf-8', errors='ignore')
+                if not public_url and '.loclx.io' in decoded:
+                    m = re.search(r'([a-zA-Z0-9-]+\.loclx\.io)', decoded)
+                    if m: public_url = "https://" + m.group(1); log(f"✅ URL: {public_url}")
+        asyncio.create_task(_parse())
+    except Exception as e: log(f"⚠️ Erro Localxpose: {e}")
+
+async def start_cloudflare():
     global public_url, tunnel_process
     try:
-        log(f"☁️ Iniciando Cloudflare Tunnel na porta {HTTP_PORT}...")
-        cloudflared_cmd = 'cloudflared.exe' if os.path.exists('cloudflared.exe') else 'cloudflared'
-        
+        cmd = 'cloudflared.exe' if sys.platform == 'win32' else 'cloudflared'
+        if not shutil.which(cmd) and os.path.exists(os.path.join(BIN_DIR, cmd)):
+             cmd = os.path.join(BIN_DIR, cmd)
+             
         if CLOUDFLARED_TOKEN and CLOUDFLARED_TOKEN.strip():
-            log("🔑 Usando Token do Cloudflare (Named Tunnel)...")
-            tunnel_process = subprocess.Popen([cloudflared_cmd, 'tunnel', 'run', '--token', CLOUDFLARED_TOKEN], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
+            tunnel_process = await asyncio.create_subprocess_exec(
+                cmd, 'tunnel', 'run', '--token', CLOUDFLARED_TOKEN,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
             public_url = "https://dash.cloudflare.com (Verifique seu painel)"
-            log("✅ Tunnel iniciado com Token! Verifique sua URL no painel da Cloudflare.")
         else:
-            log("⚡ Usando Quick Tunnel (Sem Token)...")
-            tunnel_process = subprocess.Popen([cloudflared_cmd, 'tunnel', '--url', f'http://127.0.0.1:{HTTP_PORT}'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
-            for line in tunnel_process.stdout:
-                if 'trycloudflare.com' in line:
-                    match = re.search(r'https://[^\s]+\.trycloudflare\.com', line)
-                    if match:
-                        public_url = match.group(0)
-                        log(f"✅ URL Pública: {public_url}")
-                        break
-    except Exception as e:
-        log(f"⚠️ Erro no Cloudflare: {e}")
+            tunnel_process = await asyncio.create_subprocess_exec(
+                cmd, 'tunnel', '--url', f'http://127.0.0.1:{WEB_PORT}',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+            async def _parse():
+                global public_url
+                while True:
+                    line = await tunnel_process.stdout.readline()
+                    if not line: break
+                    decoded = line.decode('utf-8', errors='ignore')
+                    if not public_url and 'trycloudflare.com' in decoded:
+                        m = re.search(r'https://[^\s]+\.trycloudflare\.com', decoded)
+                        if m: public_url = m.group(0); log(f"✅ URL: {public_url}")
+            asyncio.create_task(_parse())
+    except Exception as e: log(f"⚠️ Erro Cloudflare: {e}")
 
-def wait_for_port(port, timeout=30):
-    """Aguarda até que a porta esteja ouvindo"""
-    import socket
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+async def rtmp_loop():
+    global rtmp_process, is_streaming, stream_start_time, obs_connected, stream_enabled
+    while True:
+        if not stream_enabled:
+            is_streaming = False
+            obs_connected = False
+            await asyncio.sleep(2)
+            continue
+            
         try:
-            with socket.create_connection(('127.0.0.1', port), timeout=1):
-                return True
-        except (OSError, ConnectionRefusedError):
-            time.sleep(0.5)
-    return False
+            v_codec = ['-c:v', 'copy'] if FFMPEG_PRESET == 'copy' else [
+                '-c:v', 'libx264', '-r', '30', '-g', FFMPEG_GOP, '-keyint_min', FFMPEG_GOP, '-sc_threshold', '0',
+                '-preset', FFMPEG_PRESET, '-tune', 'zerolatency', '-profile:v', 'main',
+                '-b:v', FFMPEG_MAXRATE, '-maxrate', FFMPEG_MAXRATE, '-bufsize', FFMPEG_BUFSIZE,
+                '-threads', '0'
+            ]
+            a_codec = ['-c:a', 'copy'] if FFMPEG_PRESET == 'copy' else ['-c:a', 'aac', '-b:a', '160k', '-ar', '44100', '-af', 'aresample=async=1000']
+            
+            cmd = [
+                FFMPEG_CMD, '-listen', '1',
+                '-i', f'rtmp://0.0.0.0:{RTMP_PORT}/live/stream'
+            ] + v_codec + a_codec + [
+                '-f', 'hls', '-hls_time', FFMPEG_HLS_TIME, '-hls_list_size', FFMPEG_HLS_LIST_SIZE,
+                '-hls_flags', 'append_list+omit_endlist+independent_segments', '-hls_segment_type', 'mpegts',
+                '-hls_segment_filename', f'{STREAM_DIR}/segment_%03d.ts', '-progress', 'pipe:1', f'{STREAM_DIR}/playlist.m3u8'
+            ]
+            rtmp_process = await asyncio.create_subprocess_exec(
+                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+            obs_connected = False; is_streaming = True; stream_start_time = time.time()
+            log("⏳ Aguardando Conexão do OBS (Pronto na Porta RTMP)...")
+            
+            while True:
+                if not stream_enabled:
+                    try: rtmp_process.terminate()
+                    except: pass
+                    break
 
-def get_ffmpeg_flags():
-    flags = []
-    # Usar valores manuais das configurações
-    hls_time = FFMPEG_HLS_TIME
-    hls_list_size = FFMPEG_HLS_LIST_SIZE
-    gop = FFMPEG_GOP
-    
-    preset = FFMPEG_PRESET
-    crf = FFMPEG_CRF
-    maxrate = FFMPEG_MAXRATE
-    bufsize = FFMPEG_BUFSIZE
-    
-    # Adicionar flag zerolatency se hls_time for muito baixo (ex: < 1s)
-    try:
-        if float(hls_time) <= 1.0:
-            flags.extend(['-tune', 'zerolatency'])
-    except: pass
-        
-    flags.extend(['-preset', preset, '-crf', crf, '-maxrate', maxrate, '-bufsize', bufsize, '-g', gop])
-    return flags, hls_time, hls_list_size
+                try:
+                    line_coro = rtmp_process.stdout.readline()
+                    line = await asyncio.wait_for(line_coro, timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+                    
+                if not line: break
+                dec = line.decode('utf-8', errors='ignore').strip()
+                
+                if 'frame=' in dec or 'fps=' in dec:
+                    if not obs_connected:
+                        obs_connected = True
+                        log("✅ OBS Conectado com Sucesso! (Recebendo Vídeo)")
+                        
+                if '=' in dec:
+                    try:
+                        k, v = dec.split('=', 1)
+                        if k == 'fps': stream_metrics['fps'] = v
+                        elif k == 'bitrate': stream_metrics['bitrate'] = v
+                        elif k == 'speed': stream_metrics['speed'] = v
+                        elif k == 'drop_frames': stream_metrics['dropped'] = v
+                    except: pass
+                elif 'Error' in dec or 'fail' in dec: 
+                    # Filtra o lixo inofensivo
+                    if not 'failed to delete old segment' in dec:
+                        log(f"FFmpeg: {dec}")
+        except Exception as e:
+            log(f"Erro no rtmp loop: {e}")
+        finally:
+            obs_connected = False; is_streaming = False
+            log("⚠️ FIM da Transmissão ou Erro. Reiniciando ciclo...")
+            await asyncio.sleep(1)
 
-def start_tunnel_manager():
-    global public_url, tunnel_process, tunnel_error
-    if tunnel_process:
-        try: tunnel_process.terminate()
-        except: pass
-        tunnel_process = None
-    public_url = None
-    tunnel_error = None
-    
+async def tunnel_manager():
+    global public_url, tunnel_error
     kill_process_by_name('cloudflared.exe')
+    kill_process_by_name('cloudflared')
     kill_process_by_name('ngrok.exe')
+    kill_process_by_name('ngrok')
     kill_process_by_name('loclx.exe')
-    time.sleep(1) # Delay para garantir liberação de portas
+    kill_process_by_name('loclx')
+    await asyncio.sleep(1)
     
-    # Aguardar Flask estar pronto na porta de transmissão
-    log(f"⏳ Aguardando servidor de transmissão na porta {HTTP_PORT}...")
-    if not wait_for_port(HTTP_PORT):
-        log("❌ Erro: Servidor de Transmissão não iniciou a tempo!")
-        return
-        
-    if TUNNEL_MODE == 'local':
-        public_url = f"http://localhost:{HTTP_PORT}"
-        try: rtmp_server_process.terminate()
-        except: pass
+    public_url = None; tunnel_error = None
     if os.path.exists(STREAM_DIR): shutil.rmtree(STREAM_DIR)
     os.makedirs(STREAM_DIR, exist_ok=True)
-    kill_port(RTMP_PORT)
-    log(f"📡 Iniciando servidor RTMP na porta {RTMP_PORT}...")
     
-    def rtmp_loop():
-        global rtmp_server_process, is_streaming, stream_start_time, obs_connected
-        while True:
-            flags, hls_time, hls_list_size = get_ffmpeg_flags()
-            # Adicionado -progress pipe:1 para output legível por máquina
-            cmd = [FFMPEG_CMD, '-listen', '1', '-i', f'rtmp://0.0.0.0:{RTMP_PORT}/live/stream', '-c:v', 'libx264', '-c:a', 'aac', '-b:a', '128k', '-f', 'hls', '-hls_time', hls_time, '-hls_list_size', hls_list_size, '-hls_flags', 'delete_segments+append_list', '-hls_segment_filename', f'{STREAM_DIR}/segment_%03d.ts', '-progress', 'pipe:1', f'{STREAM_DIR}/stream.m3u8']
-            cmd[5:5] = flags
-            log(f"🚀 Executando FFmpeg (Time:{hls_time}s, Preset:{FFMPEG_PRESET})")
-            rtmp_server_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
-            obs_connected = True; is_streaming = True; stream_start_time = time.time()
-            log("✅ OBS Conectado! Stream iniciada.")
-            
-            # Parse FFmpeg output for stats (formato key=value)
-            current_stats = {}
-            try:
-                while True:
-                    line = rtmp_server_process.stdout.readline()
-                    if not line: break
-                    
-                    line = line.strip()
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        key = key.strip()
-                        value = value.strip()
-                        
-                        if key == 'fps':
-                            stream_metrics['fps'] = value
-                        elif key == 'bitrate':
-                            stream_metrics['bitrate'] = value
-                        elif key == 'speed':
-                            stream_metrics['speed'] = value
-                        elif key == 'drop_frames':
-                            stream_metrics['dropped'] = value
-                            
-                    # Log de erros críticos do FFmpeg (que geralmente não são key=value)
-                    if 'Error' in line or 'error' in line or 'fail' in line:
-                         if 'fps=' not in line: # Ignorar linhas de status antigas se aparecerem
-                            log(f"FFmpeg: {line}")
-            except Exception as e:
-                log(f"Erro ao ler stats do FFmpeg: {e}")
-            
-            rtmp_server_process.wait()
-            obs_connected = False; is_streaming = False
-            log("⚠️ OBS Desconectado. Reiniciando...")
-            time.sleep(1)
-    threading.Thread(target=rtmp_loop, daemon=True).start()
-    
-    if TUNNEL_MODE == 'ngrok':
-        start_ngrok()
-    elif TUNNEL_MODE == 'localxpose':
-        start_localxpose()
-    elif TUNNEL_MODE == 'cloudflared':
-        start_cloudflare()
+    if TUNNEL_MODE == 'local': public_url = f"http://localhost:{WEB_PORT}"
+    elif TUNNEL_MODE == 'ngrok': await start_ngrok()
+    elif TUNNEL_MODE == 'localxpose': await start_localxpose()
+    elif TUNNEL_MODE == 'cloudflared': await start_cloudflare()
 
-def safe_segment_cleanup():
+async def safe_segment_cleanup():
     while True:
-        time.sleep(10)
+        await asyncio.sleep(5)
         try:
             if not os.path.exists(STREAM_DIR): continue
             now = time.time()
-            # Listar todos os segmentos
-            all_files = [f for f in os.listdir(STREAM_DIR) if f.endswith('.ts')]
-            # Ordenar por número do segmento (assumindo formato segment_XXX.ts)
-            all_files.sort(key=lambda x: int(re.search(r'segment_(\d+)', x).group(1)) if re.search(r'segment_(\d+)', x) else 0)
-            
-            # Manter os últimos KEEP_RECENT + 10 segmentos para segurança
-            keep_count = KEEP_RECENT + 10
-            if len(all_files) > keep_count:
-                to_remove = all_files[:-keep_count] # Remover apenas os mais antigos que o buffer de segurança
-                
-                for f_name in to_remove:
-                    f_path = os.path.join(STREAM_DIR, f_name)
-                    try:
-                        # Verificação dupla de idade (apenas deletar se tiver mais de 60s)
-                        if now - os.path.getmtime(f_path) > 60:
-                            os.remove(f_path)
-                            log_segment(f"🗑️ Removido (Safe): {f_name}")
-                    except: pass
-        except Exception as e:
-            log(f"Erro no cleanup: {e}")
+            for f in os.listdir(STREAM_DIR):
+                if f.endswith('.ts'):
+                    p = os.path.join(STREAM_DIR, f)
+                    if now - os.path.getmtime(p) > 20:
+                        try: os.remove(p)
+                        except: pass
+        except: pass
 
-def monitor_stream():
-    known_segments = set()
-    while True:
-        time.sleep(1)
+async def startup_tasks():
+    load_config()
+    asyncio.create_task(rtmp_loop())
+    asyncio.create_task(tunnel_manager())
+    asyncio.create_task(safe_segment_cleanup())
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(startup_tasks())
 
 HTML_TEMPLATE = """
+""" # Copiado abaixo
+
+# We need the HTML but it is large. Let's append it manually in memory to save lines, then inject it.
+# Wait, I can just use Python string formatting to keep it identical.
+HTML_HEAD = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VRChat Live Streaming</title>
+    <title>VRChat Live Streaming (FastAPI + Otimizado)</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
@@ -428,6 +366,7 @@ HTML_TEMPLATE = """
         .status-value { font-size: 1.8rem; font-weight: 700; margin: 10px 0; }
         .status-label { color: var(--text-muted); font-size: 0.9rem; }
         .online { color: var(--success); text-shadow: 0 0 10px var(--success); }
+        .warning { color: var(--warning); text-shadow: 0 0 10px var(--warning); }
         .offline { color: var(--danger); }
         .form-group { margin-bottom: 20px; }
         label { display: block; margin-bottom: 8px; color: var(--text-muted); }
@@ -447,11 +386,6 @@ HTML_TEMPLATE = """
         ::-webkit-scrollbar { width: 8px; }
         ::-webkit-scrollbar-track { background: rgba(0,0,0,0.3); }
         ::-webkit-scrollbar-thumb { background: rgba(0, 255, 255, 0.3); border-radius: 4px; }
-        input[type=range] { -webkit-appearance: none; width: 100%; background: transparent; }
-        input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; height: 20px; width: 20px; border-radius: 50%; background: var(--primary); cursor: pointer; margin-top: -8px; box-shadow: 0 0 10px var(--primary); }
-        input[type=range]::-webkit-slider-runnable-track { width: 100%; height: 4px; cursor: pointer; background: rgba(255,255,255,0.2); border-radius: 2px; }
-        .range-labels { display: flex; justify-content: space-between; margin-top: 10px; color: var(--text-muted); font-size: 0.8rem; }
-        .range-value { float: right; color: var(--primary); font-weight: bold; }
         .tunnel-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
         .tunnel-option { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; padding: 15px; cursor: pointer; text-align: center; transition: all 0.3s; }
         .tunnel-option:hover { background: rgba(255,255,255,0.1); }
@@ -465,26 +399,30 @@ HTML_TEMPLATE = """
         .modal p { color: var(--text-muted); margin-bottom: 20px; font-size: 0.9rem; }
         .modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px; }
         .chart-container { position: relative; height: 300px; width: 100%; }
+        .label-optimized { font-size: 0.8rem; background: var(--success); color: black; padding: 2px 6px; border-radius: 4px; margin-left: 10px; vertical-align: middle; }
     </style>
 </head>
 <body>
+"""
+
+HTML_BODY = """
     <div id="starfield"></div>
-    <div id="notification" class="notification" onclick="openTokenModal()"><i class="fas fa-exclamation-triangle"></i><span>Token necessário! Clique para configurar.</span></div>
+    <div id="notification" class="notification" onclick="openTokenModal()"><i class="fas fa-exclamation-triangle"></i><span>Token necessário!</span></div>
     <div id="token-modal" class="modal-overlay">
         <div class="modal">
             <h3 id="modal-title">Configurar Token</h3>
-            <p id="modal-desc">Para usar este serviço, você precisa de um token de autenticação.</p>
+            <p id="modal-desc">Você precisa de um token.</p>
             <div class="form-group"><input type="password" id="modal-token-input" placeholder="Cole seu token aqui..."></div>
             <div class="modal-actions"><button class="btn btn-outline" onclick="closeTokenModal()">Cancelar</button><button class="btn btn-primary" onclick="saveTokenFromModal()">Salvar</button></div>
         </div>
     </div>
     <div class="sidebar">
-        <div class="brand"><i class="fas fa-vr-cardboard"></i> VRStream</div>
+        <div class="brand"><i class="fas fa-vr-cardboard"></i> VRStream <span style="font-size:10px; color:var(--success)">FASTAPI</span></div>
         <button class="nav-btn active" onclick="showTab('dashboard')"><i class="fas fa-chart-line"></i> Dashboard</button>
         <button class="nav-btn" onclick="showTab('statistics')"><i class="fas fa-chart-bar"></i> Estatísticas</button>
         <button class="nav-btn" onclick="showTab('logs')"><i class="fas fa-terminal"></i> Logs</button>
         <button class="nav-btn" onclick="showTab('settings')"><i class="fas fa-cog"></i> Configurações</button>
-        <button class="nav-btn" onclick="showTab('ffmpeg')"><i class="fas fa-video"></i> FFMPEG</button>
+        <button class="nav-btn" onclick="showTab('ffmpeg')"><i class="fas fa-video"></i> FFMPEG <span class="label-optimized">Turbo</span></button>
     </div>
     <div class="main-content">
         <div id="dashboard" class="tab-content active">
@@ -499,263 +437,264 @@ HTML_TEMPLATE = """
                 </div>
             </div>
             <div class="status-grid">
-                <div class="status-item"><div class="status-label">Status da Live</div><div class="status-value" id="stream-status">OFFLINE</div></div>
+                <div class="status-item"><div class="status-label">Motor de Transmissão</div><div class="status-value" id="stream-status">OFFLINE</div><button class="btn btn-outline" style="margin-top:10px; width:100%; justify-content:center;" onclick="toggleStream()" id="btn-toggle-stream">Ligar/Desligar</button></div>
                 <div class="status-item"><div class="status-label">OBS Studio</div><div class="status-value" id="obs-status">Desconectado</div></div>
                 <div class="status-item"><div class="status-label">Tempo Online</div><div class="status-value" id="uptime">00:00:00</div></div>
             </div>
             <div class="card" style="margin-top: 30px;">
-                <div class="card-header"><div class="card-title">Preview da Stream</div></div>
+                <div class="card-header"><div class="card-title">Preview da Stream (LL-HLS)</div></div>
                 <video id="preview-player" muted style="width: 100%; border-radius: 8px; background: #000; aspect-ratio: 16/9; object-fit: contain;"></video>
             </div>
             <div class="card" style="margin-top: 30px;">
                 <div class="card-header"><div class="card-title">URL Pública (VRChat)</div><div style="display:flex; gap:10px;"><button class="btn btn-outline" onclick="openWebPlayer()"><i class="fas fa-external-link-alt"></i> Web</button><button class="btn btn-outline" onclick="copyUrl()"><i class="fas fa-copy"></i> Copiar</button></div></div>
                 <div class="form-group"><input type="text" id="public-url" readonly value="Carregando..." style="font-family: monospace; font-size: 1.1rem; color: var(--primary);"></div>
-                <p style="color: var(--text-muted); font-size: 0.9rem;">Cole esta URL no player de vídeo do mundo no VRChat.</p>
             </div>
             <div class="card">
                 <div class="card-header"><div class="card-title">Servidor OBS (RTMP)</div><button class="btn btn-outline" onclick="copyObsUrl()"><i class="fas fa-copy"></i> Copiar</button></div>
                 <div class="form-group"><label>Servidor</label><input type="text" id="obs-url-display" readonly value="rtmp://localhost:1935/live/stream"></div>
-                <div class="form-group"><label>Chave da Stream</label><input type="text" readonly value="(qualquer coisa)" style="color: var(--text-muted);"></div>
             </div>
         </div>
         <div id="statistics" class="tab-content">
             <h2 style="margin-bottom: 20px;">Estatísticas em Tempo Real</h2>
             <div class="status-grid">
-                <div class="status-item"><div class="status-label">Espectadores (30s)</div><div class="status-value" id="stat-viewers">0</div></div>
+                <div class="status-item"><div class="status-label">Espectadores</div><div class="status-value" id="stat-viewers">0</div></div>
                 <div class="status-item"><div class="status-label">FPS</div><div class="status-value" id="stat-fps">0</div></div>
                 <div class="status-item"><div class="status-label">Bitrate</div><div class="status-value" id="stat-bitrate">0k</div></div>
                 <div class="status-item"><div class="status-label">Velocidade</div><div class="status-value" id="stat-speed">0x</div></div>
             </div>
-            <div class="card" style="margin-top: 20px;">
-                <div class="card-header"><div class="card-title">Histórico de Espectadores</div></div>
-                <div class="chart-container"><canvas id="viewersChart"></canvas></div>
-            </div>
-            <div class="card" style="margin-top: 20px;">
-                <div class="card-header"><div class="card-title">Performance de Transmissão</div></div>
-                <div class="chart-container"><canvas id="performanceChart"></canvas></div>
-            </div>
+            <div class="card" style="margin-top: 20px;"><div class="chart-container"><canvas id="viewersChart"></canvas></div></div>
+            <div class="card" style="margin-top: 20px;"><div class="chart-container"><canvas id="performanceChart"></canvas></div></div>
         </div>
         <div id="logs" class="tab-content">
             <h2 style="margin-bottom: 20px;">Logs do Sistema</h2>
             <div class="logs-wrapper">
                 <div class="log-col"><h3>Sistema & Erros</h3><div class="log-console" id="log-container"></div></div>
-                <div class="log-col"><h3>Segmentos HLS</h3><div class="log-console" id="segment-log-container"></div></div>
+                <div class="log-col"><h3>Segmentos HLS (TS)</h3><div class="log-console" id="segment-log-container"></div></div>
             </div>
         </div>
         <div id="settings" class="tab-content">
-            <h2 style="margin-bottom: 20px;">Configurações Gerais</h2>
             <div class="card">
                 <form onsubmit="saveSettings(event)">
-                    <h3 style="color: var(--primary); margin-bottom: 15px;">Tokens de Túnel</h3>
-                    <div class="form-group"><label>Ngrok Authtoken</label><input type="password" name="NGROK_TOKEN" id="conf_ngrok" placeholder="Cole seu token do ngrok aqui"></div>
-                    <div class="form-group"><label>Localxpose Token</label><input type="password" name="LOCALXPOSE_TOKEN" id="conf_localxpose" placeholder="Cole seu token do localxpose aqui"></div>
-                    <div class="form-group"><label>Cloudflare Token (Opcional)</label><input type="password" name="CLOUDFLARED_TOKEN" id="conf_cloudflared" placeholder="Cole seu token do Cloudflare Tunnel aqui"></div>
-                    <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin: 20px 0;">
+                    <h3 style="color: var(--primary); margin-bottom: 15px;">Tokens (Túneis)</h3>
+                    <div class="form-group"><label>Ngrok Authtoken</label><input type="password" name="NGROK_TOKEN" id="conf_ngrok"></div>
+                    <div class="form-group"><label>Localxpose Token</label><input type="password" name="LOCALXPOSE_TOKEN" id="conf_localxpose"></div>
+                    <div class="form-group"><label>Cloudflare Token</label><input type="password" name="CLOUDFLARED_TOKEN" id="conf_cloudflared"></div>
+                    <hr>
                     <div class="form-group"><label>Porta RTMP</label><input type="number" name="RTMP_PORT" id="conf_rtmp"></div>
-                    <div class="form-group"><label>Porta Web (Dashboard)</label><input type="number" name="WEB_PORT" id="conf_web"></div>
-                    <div class="form-group"><label>Porta HTTP (Transmissão)</label><input type="number" name="HTTP_PORT" id="conf_http"></div>
-                    <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Salvar Alterações</button>
+                    <div class="form-group"><label>Porta HTTP</label><input type="number" name="HTTP_PORT" id="conf_http"></div>
+                    <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Salvar</button>
                 </form>
             </div>
         </div>
         <div id="ffmpeg" class="tab-content">
-            <h2 style="margin-bottom: 20px;">Configurações FFMPEG</h2>
             <div class="card">
                 <form onsubmit="saveSettings(event)">
-                    <div class="form-group"><label>HLS Time (Segundos)</label><input type="text" name="FFMPEG_HLS_TIME" id="conf_hls_time" placeholder="Ex: 2"></div>
-                    <div class="form-group"><label>HLS List Size</label><input type="text" name="FFMPEG_HLS_LIST_SIZE" id="conf_hls_list_size" placeholder="Ex: 4"></div>
-                    <div class="form-group"><label>GOP Size (Frames)</label><input type="text" name="FFMPEG_GOP" id="conf_gop" placeholder="Ex: 60"></div>
-                    <hr style="border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin: 20px 0;">
-                    <div class="form-group"><label>Preset</label><input type="text" name="FFMPEG_PRESET" id="conf_preset" placeholder="Ex: veryfast"></div>
-                    <div class="form-group"><label>CRF (Qualidade)</label><input type="text" name="FFMPEG_CRF" id="conf_crf" placeholder="Ex: 23"></div>
-                    <div class="form-group"><label>Max Bitrate</label><input type="text" name="FFMPEG_MAXRATE" id="conf_maxrate" placeholder="Ex: 2500k"></div>
-                    <div class="form-group"><label>Buffer Size</label><input type="text" name="FFMPEG_BUFSIZE" id="conf_bufsize" placeholder="Ex: 5000k"></div>
+                    <div class="form-group"><label>HLS Time (1 a 2 recomendado)</label><input type="text" name="FFMPEG_HLS_TIME" id="conf_hls_time"></div>
+                    <div class="form-group"><label>HLS List Size</label><input type="text" name="FFMPEG_HLS_LIST_SIZE" id="conf_hls_list_size"></div>
+                    <div class="form-group"><label>Preset (ultrafast recomendado para delay 0)</label><input type="text" name="FFMPEG_PRESET" id="conf_preset"></div>
+                    <div class="form-group"><label>CRF (Qualidade)</label><input type="text" name="FFMPEG_CRF" id="conf_crf"></div>
+                    <div class="form-group"><label>Max Bitrate</label><input type="text" name="FFMPEG_MAXRATE" id="conf_maxrate"></div>
                     <button type="submit" class="btn btn-primary"><i class="fas fa-save"></i> Salvar FFMPEG</button>
                 </form>
             </div>
         </div>
     </div>
+"""
+
+HTML_SCRIPT = """
     <script>
         var hls = null;
         function initPlayer() {
             if(Hls.isSupported()) {
                 var video = document.getElementById('preview-player');
                 if(hls) hls.destroy();
-                hls = new Hls({ manifestLoadingTimeOut: 5000, manifestLoadingMaxRetry: 10 });
+                hls = new Hls({ 
+                    manifestLoadingTimeOut: 5000, manifestLoadingMaxRetry: 10,
+                    lowLatencyMode: true, backBufferLength: 30, liveSyncDurationCount: 2
+                });
                 hls.loadSource('/stream.m3u8');
                 hls.attachMedia(video);
-                hls.on(Hls.Events.MANIFEST_PARSED, function() { video.play().catch(e => console.log("Autoplay blocked")); });
-                hls.on(Hls.Events.ERROR, function (event, data) { if (data.fatal) { switch (data.type) { case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break; case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break; default: hls.destroy(); break; } } });
+                hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(e => console.log("Autoplay blocked")); });
+                hls.on(Hls.Events.ERROR, function(event, data) { if (data.fatal) { switch (data.type) { case Hls.ErrorTypes.NETWORK_ERROR: hls.startLoad(); break; case Hls.ErrorTypes.MEDIA_ERROR: hls.recoverMediaError(); break; default: hls.destroy(); break; } } });
             }
         }
         function createStars() { const container = document.getElementById('starfield'); for(let i=0; i<200; i++) { const star = document.createElement('div'); star.className = 'star'; const size = Math.random() * 2 + 1; star.style.left = Math.random() * 100 + '%'; star.style.top = Math.random() * 100 + '%'; star.style.width = size + 'px'; star.style.height = size + 'px'; star.style.setProperty('--duration', (Math.random() * 3 + 2) + 's'); star.style.setProperty('--opacity', Math.random()); container.appendChild(star); } }
         createStars();
         function showTab(tabId) { document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active')); document.querySelectorAll('.nav-btn').forEach(el => el.classList.remove('active')); document.getElementById(tabId).classList.add('active'); event.currentTarget.classList.add('active'); if(tabId === 'dashboard') { initPlayer(); } }
+        
         let currentMode = 'cloudflared'; let pendingMode = null;
-        function setTunnelMode(mode) { document.querySelectorAll('.tunnel-option').forEach(el => el.classList.remove('active')); document.getElementById('mode-' + mode).classList.add('active'); fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ TUNNEL_MODE: mode }) }).then(r => r.json()).then(res => { if(res.success) { currentMode = mode; setTimeout(() => fetch('/api/restart_tunnel', { method: 'POST' }), 500); } }); }
-        function openTokenModal(mode) { const modal = document.getElementById('token-modal'); const title = document.getElementById('modal-title'); const desc = document.getElementById('modal-desc'); pendingMode = mode || currentMode; document.getElementById('modal-token-input').value = ''; if (pendingMode === 'ngrok') { title.textContent = "Configurar Ngrok"; desc.textContent = "Insira seu Authtoken do Ngrok (dashboard.ngrok.com)"; } else if (pendingMode === 'localxpose') { title.textContent = "Configurar Localxpose"; desc.textContent = "Insira seu Access Token do Localxpose"; } else if (pendingMode === 'cloudflared') { title.textContent = "Configurar Cloudflare"; desc.textContent = "Deixe em branco para Quick Tunnel (Grátis/Sem conta) ou insira Token."; } modal.style.display = 'flex'; document.getElementById('notification').classList.remove('show'); }
+        function setTunnelMode(mode) { 
+            document.querySelectorAll('.tunnel-option').forEach(el => el.classList.remove('active')); 
+            document.getElementById('mode-' + mode).classList.add('active'); 
+            fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ TUNNEL_MODE: mode }) }).then(r => r.json()).then(res => { if(res.success) { currentMode = mode; setTimeout(() => fetch('/api/restart_tunnel', { method: 'POST' }), 500); } }); 
+        }
+        function openTokenModal(mode) { pendingMode = mode || currentMode; document.getElementById('token-modal').style.display='flex'; }
         function closeTokenModal() { document.getElementById('token-modal').style.display = 'none'; }
-        function saveTokenFromModal() { const token = document.getElementById('modal-token-input').value; if(!token && pendingMode !== 'cloudflared') return; const data = {}; if (pendingMode === 'ngrok') data.NGROK_TOKEN = token; else if (pendingMode === 'localxpose') data.LOCALXPOSE_TOKEN = token; else if (pendingMode === 'cloudflared') data.CLOUDFLARED_TOKEN = token; fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }).then(r => r.json()).then(res => { if(res.success) { closeTokenModal(); alert('Configuração salva! Reiniciando túnel...'); setTunnelMode(pendingMode); } }); }
+        function saveTokenFromModal() { const token = document.getElementById('modal-token-input').value; if(!token && pendingMode !== 'cloudflared') return; const data = {}; if (pendingMode === 'ngrok') data.NGROK_TOKEN = token; else if (pendingMode === 'localxpose') data.LOCALXPOSE_TOKEN = token; else if (pendingMode === 'cloudflared') data.CLOUDFLARED_TOKEN = token; fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }).then(r => r.json()).then(res => { if(res.success) { closeTokenModal(); alert('Configuração salva! Reiniciando...'); setTunnelMode(pendingMode); } }); }
         
         let viewersChart, performanceChart;
-        const maxDataPoints = 60;
         function initCharts() {
             const ctxViewers = document.getElementById('viewersChart').getContext('2d');
-            viewersChart = new Chart(ctxViewers, { type: 'line', data: { labels: [], datasets: [{ label: 'Espectadores', data: [], borderColor: '#00ffff', backgroundColor: 'rgba(0, 255, 255, 0.1)', tension: 0.4, fill: true }] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true, grid: { color: 'rgba(255,255,255,0.1)' } }, x: { display: false } }, plugins: { legend: { labels: { color: '#fff' } } } } });
+            viewersChart = new Chart(ctxViewers, { type: 'line', data: { labels: [], datasets: [{ label: 'Espectadores', data: [], borderColor: '#00ffff', backgroundColor: 'rgba(0, 255, 255, 0.1)', tension: 0.4, fill: true }] }, options: { responsive: true, maintainAspectRatio: false, scales: { x: { display: false } } } });
             const ctxPerf = document.getElementById('performanceChart').getContext('2d');
-            performanceChart = new Chart(ctxPerf, { type: 'line', data: { labels: [], datasets: [{ label: 'FPS', data: [], borderColor: '#00ff9d', tension: 0.4, yAxisID: 'y' }, { label: 'Bitrate (kbps)', data: [], borderColor: '#ff4757', tension: 0.4, yAxisID: 'y1' }] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { type: 'linear', display: true, position: 'left', grid: { color: 'rgba(255,255,255,0.1)' } }, y1: { type: 'linear', display: true, position: 'right', grid: { drawOnChartArea: false } }, x: { display: false } }, plugins: { legend: { labels: { color: '#fff' } } } } });
+            performanceChart = new Chart(ctxPerf, { type: 'line', data: { labels: [], datasets: [{ label: 'FPS', data: [], borderColor: '#00ff9d', tension: 0.4, yAxisID: 'y' }, { label: 'Bitrate (kbps)', data: [], borderColor: '#ff4757', tension: 0.4, yAxisID: 'y1' }] }, options: { responsive: true, maintainAspectRatio: false, scales: { y: { type: 'linear', position: 'left' }, y1: { type: 'linear', position: 'right' }, x: { display: false } } } });
         }
         function updateCharts(data) {
             const now = new Date().toLocaleTimeString();
-            if (viewersChart) { viewersChart.data.labels.push(now); viewersChart.data.datasets[0].data.push(data.viewers || 0); if (viewersChart.data.labels.length > maxDataPoints) { viewersChart.data.labels.shift(); viewersChart.data.datasets[0].data.shift(); } viewersChart.update(); }
-            if (performanceChart && data.metrics) { performanceChart.data.labels.push(now); performanceChart.data.datasets[0].data.push(parseFloat(data.metrics.fps) || 0); let bitrateVal = parseFloat(data.metrics.bitrate.replace('kbits/s', '').replace('k', '')) || 0; performanceChart.data.datasets[1].data.push(bitrateVal); if (performanceChart.data.labels.length > maxDataPoints) { performanceChart.data.labels.shift(); performanceChart.data.datasets[0].data.shift(); performanceChart.data.datasets[1].data.shift(); } performanceChart.update(); }
+            if (viewersChart) { viewersChart.data.labels.push(now); viewersChart.data.datasets[0].data.push(data.viewers || 0); if (viewersChart.data.labels.length > 60) { viewersChart.data.labels.shift(); viewersChart.data.datasets[0].data.shift(); } viewersChart.update(); }
+            if (performanceChart && data.metrics) { performanceChart.data.labels.push(now); performanceChart.data.datasets[0].data.push(parseFloat(data.metrics.fps) || 0); let bitrateVal = parseFloat(data.metrics.bitrate.replace('kbits/s', '').replace('k', '')) || 0; performanceChart.data.datasets[1].data.push(bitrateVal); if (performanceChart.data.labels.length > 60) { performanceChart.data.labels.shift(); performanceChart.data.datasets[0].data.shift(); performanceChart.data.datasets[1].data.shift(); } performanceChart.update(); }
         }
 
-        function updateStatus() { fetch('/api/status').then(r => r.json()).then(data => { 
-            const statusEl = document.getElementById('stream-status'); if(data.streaming) { statusEl.textContent = "AO VIVO"; statusEl.className = "status-value online"; } else { statusEl.textContent = "OFFLINE"; statusEl.className = "status-value offline"; } 
-            const obsEl = document.getElementById('obs-status'); obsEl.textContent = data.obs_connected ? "Conectado" : "Desconectado"; obsEl.style.color = data.obs_connected ? "var(--success)" : "var(--danger)"; 
-            const urlEl = document.getElementById('public-url'); if(data.url) { urlEl.value = data.url + "/stream.m3u8"; } else { urlEl.value = "Aguardando..."; } 
-            const logContainer = document.getElementById('log-container'); logContainer.innerHTML = data.logs.map(l => `<div class="log-line">${l}</div>`).join(''); logContainer.scrollTop = logContainer.scrollHeight; 
-            const segContainer = document.getElementById('segment-log-container'); if(data.segment_logs) { segContainer.innerHTML = data.segment_logs.map(l => `<div class="log-line">${l}</div>`).join(''); segContainer.scrollTop = segContainer.scrollHeight; } 
-            if(data.tunnel_error) { const notif = document.getElementById('notification'); if(data.tunnel_error.includes('missing_token')) { notif.classList.add('show'); if(document.getElementById('token-modal').style.display !== 'flex') { openTokenModal(data.tunnel_mode); } } }
-            
-            document.getElementById('stat-viewers').textContent = data.viewers || 0;
-            if(data.metrics) { document.getElementById('stat-fps').textContent = data.metrics.fps; document.getElementById('stat-bitrate').textContent = data.metrics.bitrate; document.getElementById('stat-speed').textContent = data.metrics.speed; }
-            updateCharts(data);
-        }); }
-        function loadSettings() { fetch('/api/settings').then(r => r.json()).then(data => { 
-            document.getElementById('conf_rtmp').value = data.RTMP_PORT || 1935; 
-            document.getElementById('conf_web').value = data.WEB_PORT || 5000; 
-            document.getElementById('conf_http').value = data.HTTP_PORT || 8000; 
-            document.getElementById('conf_ngrok').value = data.NGROK_TOKEN || ''; 
-            document.getElementById('conf_localxpose').value = data.LOCALXPOSE_TOKEN || ''; 
-            document.getElementById('conf_cloudflared').value = data.CLOUDFLARED_TOKEN || ''; 
-            document.getElementById('conf_hls_time').value = data.FFMPEG_HLS_TIME || '2';
-            document.getElementById('conf_hls_list_size').value = data.FFMPEG_HLS_LIST_SIZE || '4';
-            document.getElementById('conf_gop').value = data.FFMPEG_GOP || '60';
-            document.getElementById('conf_preset').value = data.FFMPEG_PRESET || 'veryfast';
-            document.getElementById('conf_crf').value = data.FFMPEG_CRF || '23';
-            document.getElementById('conf_maxrate').value = data.FFMPEG_MAXRATE || '2500k';
-            document.getElementById('conf_bufsize').value = data.FFMPEG_BUFSIZE || '5000k';
-            currentMode = data.TUNNEL_MODE || 'cloudflared'; 
-            document.querySelectorAll('.tunnel-option').forEach(el => el.classList.remove('active')); 
-            const activeEl = document.getElementById('mode-' + currentMode); 
-            if(activeEl) activeEl.classList.add('active'); 
-            const obsUrlDisplay = document.getElementById('obs-url-display'); 
-            if(obsUrlDisplay) { obsUrlDisplay.value = `rtmp://localhost:${data.RTMP_PORT || 1935}/live/stream`; } 
-        }); }
-        function saveSettings(e) { e.preventDefault(); const formData = new FormData(e.target); const data = Object.fromEntries(formData.entries()); if(data.RTMP_PORT) data.RTMP_PORT = parseInt(data.RTMP_PORT); if(data.WEB_PORT) data.WEB_PORT = parseInt(data.WEB_PORT); if(data.HTTP_PORT) data.HTTP_PORT = parseInt(data.HTTP_PORT); fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }).then(r => r.json()).then(res => { if(res.success) { alert('Configurações salvas! Reiniciando stream...'); fetch('/api/restart_tunnel', { method: 'POST' }); loadSettings(); } }); }
+        function updateStatus() { 
+            fetch('/api/status').then(r => r.json()).then(data => { 
+                const statusEl = document.getElementById('stream-status'); 
+                if(data.stream_enabled) {
+                    if(data.obs_connected) { statusEl.textContent = "AO VIVO"; statusEl.className = "status-value online"; }
+                    else { statusEl.textContent = "AGUARDANDO OBS"; statusEl.className = "status-value warning"; }
+                } else { statusEl.textContent = "DESLIGADO"; statusEl.className = "status-value offline"; } 
+                
+                const btnToggle = document.getElementById('btn-toggle-stream');
+                if(btnToggle) { btnToggle.innerHTML = data.stream_enabled ? '<i class="fas fa-stop"></i> Parar Motor HD' : '<i class="fas fa-play"></i> Ligar Motor HD'; btnToggle.className = data.stream_enabled ? 'btn btn-outline' : 'btn btn-primary'; }
+
+                const obsEl = document.getElementById('obs-status'); obsEl.textContent = data.obs_connected ? "Conectado" : "Desconectado"; obsEl.style.color = data.obs_connected ? "var(--success)" : "var(--danger)"; 
+                const urlEl = document.getElementById('public-url'); if(data.url) { urlEl.value = data.url + "/stream.m3u8"; } else { urlEl.value = "Aguardando..."; } 
+                const logContainer = document.getElementById('log-container'); logContainer.innerHTML = data.logs.map(l => `<div class="log-line">${l}</div>`).join(''); logContainer.scrollTop = logContainer.scrollHeight; 
+                if(data.tunnel_error && data.tunnel_error.includes('missing')) document.getElementById('notification').classList.add('show');
+                document.getElementById('stat-viewers').textContent = data.viewers || 0;
+                if(data.metrics) { document.getElementById('stat-fps').textContent = data.metrics.fps; document.getElementById('stat-bitrate').textContent = data.metrics.bitrate; document.getElementById('stat-speed').textContent = data.metrics.speed; }
+                updateCharts(data);
+            }); 
+        }
+        function loadSettings() { fetch('/api/settings').then(r => r.json()).then(data => { document.getElementById('conf_rtmp').value = data.RTMP_PORT; document.getElementById('conf_http').value = data.HTTP_PORT; document.getElementById('conf_ngrok').value = data.NGROK_TOKEN||''; document.getElementById('conf_localxpose').value = data.LOCALXPOSE_TOKEN||''; document.getElementById('conf_cloudflared').value = data.CLOUDFLARED_TOKEN||''; document.getElementById('conf_hls_time').value = data.FFMPEG_HLS_TIME; document.getElementById('conf_hls_list_size').value = data.FFMPEG_HLS_LIST_SIZE; document.getElementById('conf_preset').value = data.FFMPEG_PRESET; document.getElementById('conf_crf').value = data.FFMPEG_CRF; document.getElementById('conf_maxrate').value = data.FFMPEG_MAXRATE; currentMode = data.TUNNEL_MODE || 'cloudflared'; document.querySelectorAll('.tunnel-option').forEach(el => el.classList.remove('active')); const act = document.getElementById('mode-' + currentMode); if(act) act.classList.add('active'); const obsD = document.getElementById('obs-url-display'); if(obsD) obsD.value = `rtmp://localhost:${data.RTMP_PORT}/live/stream`; }); }
+        function saveSettings(e) { e.preventDefault(); const formData = new FormData(e.target); const data = Object.fromEntries(formData.entries()); fetch('/api/settings', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(data) }).then(r => r.json()).then(res => { if(res.success) { alert('Configurações salvas! Reiniciando...'); fetch('/api/restart_tunnel', { method: 'POST' }); loadSettings(); } }); }
+        function toggleStream() { fetch('/api/toggle_stream', {method: 'POST'}).then(r => r.json()); }
         function openWebPlayer() { const url = document.getElementById('public-url').value; if(url && url.includes('/stream.m3u8')) { window.open(url.replace('/stream.m3u8', '/watch/live'), '_blank'); } }
         function copyUrl() { const el = document.getElementById('public-url'); el.select(); document.execCommand('copy'); alert('URL copiada!'); }
         function copyObsUrl() { const el = document.getElementById('obs-url-display'); el.select(); document.execCommand('copy'); alert('Copiado!'); }
+        
         setInterval(updateStatus, 2000); updateStatus(); loadSettings(); initPlayer(); initCharts();
     </script>
 </body>
 </html>
 """
+HTML_TEMPLATE = HTML_HEAD + HTML_BODY + HTML_SCRIPT
 
-@app.route('/')
-def index():
-    base = public_url or f'http://localhost:{WEB_PORT}'
-    return HTML_TEMPLATE.replace('PUBLIC_URL', base)
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML_TEMPLATE.replace('PUBLIC_URL', public_url or f'http://localhost:{WEB_PORT}')
 
-@app.route('/watch/live')
-def watch():
-    host = request.host
+@app.get("/watch/live", response_class=HTMLResponse)
+async def watch(request: Request):
+    host = request.url.netloc
     protocol = 'https' if 'trycloudflare.com' in host or 'ngrok' in host or 'loclx' in host else 'http'
     hls_url = f'{protocol}://{host}/stream.m3u8'
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>VRChat Live Stream</title>
-<meta property="og:type" content="video.other"><meta property="og:video" content="{hls_url}"><meta property="og:video:url" content="{hls_url}"><meta property="og:video:secure_url" content="{hls_url}"><meta property="og:video:type" content="application/x-mpegURL">
-</head>
-<body style="margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh">
-<video id="player" controls autoplay muted playsinline width="100%" style="max-width:100vw;max-height:100vh" src="{hls_url}"></video>
-<script>const video=document.getElementById('player');video.addEventListener('error',()=>{{setTimeout(()=>video.load(),3000)}});</script>
-</body></html>"""
-    return Response(html, mimetype='text/html')
+    html = f"""<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>VRChat Live Stream</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>body{{margin:0;background:#000;display:flex;align-items:center;justify-content:center;min-height:100vh;overflow:hidden;}} video{{width:100%;max-width:100vw;max-height:100vh;object-fit:contain;}}</style>
+    </head><body><video id="player" controls autoplay muted playsinline></video>
+    <script>
+        const video = document.getElementById('player');
+        let hls = null; let isHlsPlaying = false;
+        function playOffline() {{
+            if (hls) {{ hls.destroy(); hls = null; }}
+            if (!video.src.includes('offline.mp4')) {{ video.src = '/offline.mp4'; video.loop = true; video.play().catch(e=>console.log(e)); isHlsPlaying = false; }}
+        }}
+        function playHls() {{
+            if (!isHlsPlaying) {{
+                if (Hls.isSupported()) {{
+                    if(hls) hls.destroy();
+                    hls = new Hls({{lowLatencyMode: true, backBufferLength: 30, manifestLoadingMaxRetry: 10}});
+                    hls.loadSource('{hls_url}'); hls.attachMedia(video); video.loop = false;
+                    hls.on(Hls.Events.MANIFEST_PARSED, () => {{ video.play().catch(e=>console.log(e)); }});
+                }} else if (video.canPlayType('application/vnd.apple.mpegurl')) {{ video.src = '{hls_url}'; video.loop = false; video.play(); }}
+                isHlsPlaying = true;
+            }}
+        }}
+        async function checkStatus() {{
+            try {{ let r = await fetch('/api/status'); let data = await r.json(); if(data.obs_connected) playHls(); else playOffline(); }} catch(e) {{ playOffline(); }}
+        }}
+        checkStatus(); setInterval(checkStatus, 3000);
+    </script></body></html>"""
+    return html
 
-@app.route('/stream.m3u8')
-def playlist():
-    active_viewers[get_client_ip()] = time.time()
-    path = os.path.join(STREAM_DIR, 'stream.m3u8')
+@app.get("/offline.mp4")
+async def offline_video():
+    path = os.path.join(base_dir, 'Offline.mp4')
+    if os.path.exists(path): return FileResponse(path, media_type='video/mp4')
+    return Response(status_code=404)
+
+@app.get("/stream.m3u8")
+async def stream_m3u8(request: Request):
+    content = """#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
+/playlist.m3u8
+"""
+    return Response(content=content, media_type='application/vnd.apple.mpegurl', headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache, no-store, must-revalidate'})
+
+@app.get("/playlist.m3u8")
+async def playlist(request: Request):
+    active_viewers[get_client_ip(request)] = time.time()
+    path = os.path.join(STREAM_DIR, 'playlist.m3u8')
     if os.path.exists(path):
         with open(path, 'r') as f: content = f.read()
         lines = [f'/segment/{os.path.basename(l)}' if l.endswith('.ts') else l for l in content.split('\n')]
-        return Response('\n'.join(lines), mimetype='application/vnd.apple.mpegurl', headers={'Access-Control-Allow-Origin': '*'})
-    return Response('#EXTM3U\n#EXT-X-VERSION:3\n', mimetype='application/vnd.apple.mpegurl')
+        return Response(content="\n".join(lines), media_type='application/vnd.apple.mpegurl', headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0'})
+    return Response(content="#EXTM3U\n#EXT-X-VERSION:3\n", media_type='application/vnd.apple.mpegurl', headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
 
-@app.route('/segment/<filename>')
-def segment(filename):
-    active_viewers[get_client_ip()] = time.time()
+@app.get("/segment/{filename}")
+async def segment(filename: str, request: Request):
+    active_viewers[get_client_ip(request)] = time.time()
     path = os.path.join(STREAM_DIR, filename)
-    if os.path.exists(path): return send_file(path, mimetype='video/mp2t')
-    return 'Not found', 404
+    if os.path.exists(path): return FileResponse(path, media_type='video/mp2t', headers={'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache', 'Expires': '0'})
+    return Response(status_code=404)
 
-@app.route('/api/status')
-def api_status():
-    global public_url, tunnel_error, tunnel_process
-    
-    # Verificar saúde do processo do túnel
-    if tunnel_process and tunnel_process.poll() is not None:
-        public_url = None
-        tunnel_error = 'tunnel_died'
-
-    # Limpar viewers antigos (30s timeout)
+@app.get("/api/status")
+async def api_status():
+    global public_url, tunnel_error
     now = time.time()
     to_remove = [ip for ip, last_seen in active_viewers.items() if now - last_seen > 30]
-    for ip in to_remove: del active_viewers[ip]
-    
-    return jsonify({
-        'streaming': is_streaming, 
-        'obs_connected': obs_connected, 
-        'url': public_url, 
-        'logs': connection_log[-20:], 
-        'segment_logs': segment_log[-20:], 
-        'tunnel_mode': TUNNEL_MODE, 
-        'tunnel_error': tunnel_error,
-        'viewers': max(0, len(active_viewers) - 1),
-        'metrics': stream_metrics
-    })
+    for ip in to_remove: active_viewers.pop(ip, None)
+    return {
+        'streaming': is_streaming, 'stream_enabled': stream_enabled, 'obs_connected': obs_connected, 'url': public_url,
+        'logs': connection_log[-20:], 'segment_logs': segment_log[-20:],
+        'tunnel_mode': TUNNEL_MODE, 'tunnel_error': tunnel_error,
+        'viewers': max(0, len(active_viewers)), 'metrics': stream_metrics
+    }
 
-@app.route('/api/settings', methods=['GET', 'POST'])
-def api_settings():
-    if request.method == 'POST':
-        if save_config_file({**load_config(), **request.json}): return jsonify({'success': True})
-        return jsonify({'success': False}), 500
-    return jsonify(load_config())
+@app.get("/api/settings")
+async def get_settings(): return load_config()
 
-@app.route('/api/restart_tunnel', methods=['POST'])
-def api_restart_tunnel():
-    threading.Thread(target=start_tunnel_manager, daemon=True).start()
-    return jsonify({'success': True})
+@app.post("/api/settings")
+async def post_settings(req: Request):
+    try:
+        data = await req.json()
+        if save_config_file(data): return {"success": True}
+        return JSONResponse(status_code=500, content={"success": False})
+    except: return JSONResponse(status_code=500, content={"success": False})
 
-@app.route('/api/system')
-def api_system():
-    return jsonify({'ffmpeg': os.path.exists(FFMPEG_CMD) or shutil.which('ffmpeg') is not None, 'cloudflared': os.path.exists('cloudflared.exe') or shutil.which('cloudflared') is not None})
+@app.post("/api/restart_tunnel")
+async def api_restart_tunnel(bt: BackgroundTasks):
+    bt.add_task(tunnel_manager)
+    return {"success": True}
 
-@app.route('/api/shutdown', methods=['POST'])
-def api_shutdown():
+@app.post("/api/toggle_stream")
+async def api_toggle_stream():
+    global stream_enabled
+    stream_enabled = not stream_enabled
+    if not stream_enabled: kill_process_by_name(FFMPEG_CMD)
+    return {"enabled": stream_enabled}
+
+@app.get("/api/system")
+async def api_system(): return {"status": "ok", "fastapi": True}
+
+@app.post("/api/shutdown")
+async def api_shutdown():
     log("🛑 Shutdown solicitado...")
-    if rtmp_server_process: rtmp_server_process.terminate()
-    if tunnel_process: tunnel_process.terminate()
     os.kill(os.getpid(), signal.SIGINT)
-    return jsonify({'success': True})
-
-def run_startup_tasks():
-    load_config()
-    if not (os.path.exists(FFMPEG_CMD) or shutil.which('ffmpeg')):
-        log("❌ FFmpeg NÃO encontrado!")
-        return
-    # start_simple_rtmp removed as start_tunnel_manager handles it
-    threading.Thread(target=monitor_stream, daemon=True).start()
-    threading.Thread(target=safe_segment_cleanup, daemon=True).start()
-    time.sleep(2)
-    threading.Thread(target=start_tunnel_manager, daemon=True).start()
+    return {"success": True}
 
 if __name__ == '__main__':
-    threading.Thread(target=run_startup_tasks, daemon=True).start()
-    # Iniciar servidor de transmissão (HTTP_PORT) em thread separada
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=HTTP_PORT, threaded=True, use_reloader=False), daemon=True).start()
-    # Iniciar servidor de dashboard (WEB_PORT) na thread principal
-    app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, use_reloader=False)
+    # Apenas como fallback ou caso executem via CLI: `python Live_Cdnd.py`
+    config = load_config()
+    loop_type = 'uvloop' if sys.platform != 'win32' else 'auto'
+    uvicorn.run(app, host='0.0.0.0', port=int(config.get('WEB_PORT', 5000)), loop=loop_type, log_level='warning')
