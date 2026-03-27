@@ -1,5 +1,5 @@
 # VRStream
-**Desenvolvido e Criado por:** Kauã
+**Desenvolvido e Criado por:** Cloud
 
 VRStream é um motor de transmissão independente RTMP -> HLS de ultrabaixa latência. Construído com FastAPI e FFmpeg, foi desenhado para aguentar transmissões de vídeo extremas para o VRChat e WebPlayers, rodando sob servidores Linux com máxima prioridade de processamento.
 
